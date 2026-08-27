@@ -430,6 +430,7 @@ impl Core {
                     latency_ms: 0.0,
                     cost: 0,
                     last_error,
+                    headers: None,
                 });
             }
         }

@@ -273,10 +273,21 @@ Both `peers` entries and `listen` addresses support optional query-string parame
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `password=PASSWORD` | Require this password from connecting peers (max 64 chars) | `?password=secret` |
+| `forwarded_headers=LIST` | Comma-separated list of HTTP request headers to capture during WebSocket handshakes (`ws://`/`wss://` only, e.g. behind reverse proxies) | `?forwarded_headers=CF-Connecting-IP,X-Forwarded-For` |
 
 Duration values for `maxbackoff` accept plain seconds (`30`) or human-readable format (`30s`, `5m`, `1h`, `1h30m`).
 
 **Example with multiple parameters:**
+
+```toml
+listen = [
+    # Plain TCP listener
+    "tcp://[::]:12345",
+
+    # WebSocket listener behind Cloudflare/Nginx capturing client origin headers
+    "ws://127.0.0.1:8080?forwarded_headers=CF-Connecting-IP,X-Forwarded-For",
+]
+```
 
 ```toml
 peers = [

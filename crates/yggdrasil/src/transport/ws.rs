@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::collections::HashMap;
 
 use futures_util::{Sink, Stream as FuturesStream};
 use ironwood::types::AsyncConn;
@@ -77,21 +78,27 @@ pub(crate) async fn ws_client_handshake(
             .await
             .map_err(|e| format!("WebSocket handshake failed: {}", e))?;
 
-    Ok(WsStream::new(ws_stream, remote_addr, peer_cert))
+    Ok(WsStream::new(ws_stream, remote_addr, peer_cert, None))
 }
 
 /// Perform a WebSocket server handshake, requiring the Yggdrasil subprotocol
 /// (like yggdrasil-go). Also answers `/health` and `/healthz` with a plain
 /// HTTP 200 so the listener can sit behind a load balancer's health checks.
+/// If `forwarded_headers` is non-empty, any matching request headers are
+/// captured and attached to the resulting `WsStream`.
 pub(crate) async fn ws_server_handshake(
     stream: Box<dyn AsyncConn>,
     remote_addr: SocketAddr,
     peer_cert: Option<CertificateDer<'static>>,
+    forwarded_headers: &[String],
 ) -> Result<WsStream, String> {
     use tokio_tungstenite::tungstenite::handshake::server::{
         ErrorResponse, Request as WsRequest, Response as WsResponse,
     };
     use tokio_tungstenite::tungstenite::http::StatusCode;
+    use tokio_tungstenite::tungstenite::http::header::HeaderName;
+
+    let mut captured_headers: Option<HashMap<String, String>> = None;
 
     let callback =
         |req: &WsRequest, mut response: WsResponse| -> Result<WsResponse, ErrorResponse> {
@@ -119,6 +126,41 @@ pub(crate) async fn ws_server_handshake(
                 return Err(resp);
             }
 
+            // Capture configured forwarded headers if present
+            if !forwarded_headers.is_empty() {
+                let mut map = HashMap::new();
+                for name in forwarded_headers {
+                    // Safely ignore invalid or malformed header names in configuration
+                    let Ok(header_name) = HeaderName::try_from(name.as_str()) else {
+                        continue;
+                    };
+
+                    let values: Vec<&str> = req
+                        .headers()
+                        .get_all(&header_name)
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .collect();
+
+                    if !values.is_empty() {
+                        let combined = values.join(", ");
+                        // Strip control characters and cap length to prevent log forging
+                        let cleaned: String = combined
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(256)
+                            .collect();
+                        let trimmed = cleaned.trim();
+                        if !trimmed.is_empty() {
+                            map.insert(name.clone(), trimmed.to_string());
+                        }
+                    }
+                }
+                if !map.is_empty() {
+                    captured_headers = Some(map);
+                }
+            }
+
             response.headers_mut().insert(
                 "Sec-WebSocket-Protocol",
                 WS_SUBPROTOCOL.parse().expect("valid header value"),
@@ -131,7 +173,7 @@ pub(crate) async fn ws_server_handshake(
             .await
             .map_err(|e| format!("WebSocket handshake failed: {}", e))?;
 
-    Ok(WsStream::new(ws_stream, remote_addr, peer_cert))
+    Ok(WsStream::new(ws_stream, remote_addr, peer_cert, captured_headers))
 }
 
 /// Adapts a type-erased WebSocket stream to AsyncRead + AsyncWrite.
@@ -150,6 +192,8 @@ pub(crate) struct WsStream {
     remote_addr: SocketAddr,
     /// TLS certificate of the peer (wss only), for cert/identity binding.
     peer_cert: Option<CertificateDer<'static>>,
+    /// HTTP headers captured from incoming upgrade request (if enabled).
+    headers: Option<HashMap<String, String>>,
 }
 
 impl WsStream {
@@ -157,6 +201,7 @@ impl WsStream {
         ws: WebSocketStream<Box<dyn AsyncConn>>,
         remote_addr: SocketAddr,
         peer_cert: Option<CertificateDer<'static>>,
+        headers: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
             ws,
@@ -164,6 +209,7 @@ impl WsStream {
             read_pos: 0,
             remote_addr,
             peer_cert,
+            headers,
         }
     }
 
@@ -174,6 +220,10 @@ impl WsStream {
     pub(crate) fn peer_cert(&self) -> Option<&CertificateDer<'static>> {
         self.peer_cert.as_ref()
     }
+
+    pub(crate) fn headers(&self) -> Option<&HashMap<String, String>> {
+        self.headers.as_ref()
+    } 
 }
 
 impl AsyncRead for WsStream {
@@ -280,7 +330,7 @@ mod tests {
         let (client_io, server_io) = duplex_pair();
 
         let server = tokio::spawn(async move {
-            ws_server_handshake(server_io, dummy_addr(), None)
+            ws_server_handshake(server_io, dummy_addr(), None, &[])
                 .await
                 .expect("server handshake")
         });
@@ -320,7 +370,7 @@ mod tests {
 
         let (client_io, server_io) = duplex_pair();
         let server = tokio::spawn(async move {
-            ws_server_handshake(server_io, dummy_addr(), None).await
+            ws_server_handshake(server_io, dummy_addr(), None, &[]).await
         });
 
         // Plain WebSocket client without Sec-WebSocket-Protocol
@@ -350,7 +400,7 @@ mod tests {
         let (client_io, server_io) = duplex_pair();
 
         let server = tokio::spawn(async move {
-            ws_server_handshake(server_io, dummy_addr(), None)
+            ws_server_handshake(server_io, dummy_addr(), None, &[])
                 .await
                 .expect("server handshake")
         });
@@ -391,4 +441,71 @@ mod tests {
         }
         writer.abort();
     }
+
+    /// Verify that configured headers are captured during WebSocket server handshake,
+    /// including IPv4, IPv6 (RFC 3849 documentation prefixes), ports, and repeated headers.
+    #[tokio::test]
+    async fn test_ws_server_captures_forwarded_headers() {
+        use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+        use tokio_tungstenite::tungstenite::http::Request;
+
+        let (client_io, server_io) = duplex_pair();
+        let forwarded_headers = vec![
+            "CF-Connecting-IP".to_string(),
+            "X-Forwarded-For".to_string(),
+            "X-Real-IP".to_string(),
+            "Forwarded".to_string(),
+            "Invalid Header Name With Spaces".to_string(),
+        ];
+
+        let server = tokio::spawn(async move {
+            ws_server_handshake(server_io, dummy_addr(), None, &forwarded_headers)
+                .await
+                .expect("server handshake")
+        });
+
+        let request = Request::builder()
+            .uri("ws://127.0.0.1:1/")
+            .header("Host", "127.0.0.1:1")
+            .header("Sec-WebSocket-Protocol", WS_SUBPROTOCOL)
+            .header("Sec-WebSocket-Key", generate_key())
+            .header("Sec-WebSocket-Version", "13")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("CF-Connecting-IP", "2001:db8::1")
+            .header("X-Forwarded-For", "198.51.100.42:8080")
+            .header("X-Forwarded-For", "[2001:db8:cafe::17]:54321")
+            .header("X-Real-IP", "[2001:db8::42]:9001")
+            .header("Forwarded", "for=\"[2001:db8::2]:12345\";proto=wss")
+            .header("X-Ignored-Header", "should-not-be-captured")
+            .body(())
+            .unwrap();
+
+        let (client, _) = tokio_tungstenite::client_async(request, client_io)
+            .await
+            .expect("client handshake");
+        let server_stream = server.await.unwrap();
+
+        let headers = server_stream.headers().expect("headers should be present");
+        assert_eq!(
+            headers.get("CF-Connecting-IP").map(|s| s.as_str()),
+            Some("2001:db8::1")
+        );
+        assert_eq!(
+            headers.get("X-Forwarded-For").map(|s| s.as_str()),
+            Some("198.51.100.42:8080, [2001:db8:cafe::17]:54321")
+        );
+        assert_eq!(
+            headers.get("X-Real-IP").map(|s| s.as_str()),
+            Some("[2001:db8::42]:9001")
+        );
+        assert_eq!(
+            headers.get("Forwarded").map(|s| s.as_str()),
+            Some("for=\"[2001:db8::2]:12345\";proto=wss")
+        );
+        assert!(!headers.contains_key("X-Ignored-Header"));
+        assert!(!headers.contains_key("Invalid Header Name With Spaces"));
+
+        drop(client);
+    } 
 }

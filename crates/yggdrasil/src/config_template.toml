@@ -34,10 +34,16 @@ peers = []
 #
 # Optional query parameters:
 #   password=SECRET  - require a shared password from connecting peers (max 64 chars)
+#   forwarded_headers=HEADER1,HEADER2 (ws/wss only)
+#       Extract client IP/origin headers during WebSocket handshakes
+#       (e.g., CF-Connecting-IP, X-Forwarded-For).
+#       SECURITY: Only configure this on private/loopback listeners behind a
+#       trusted reverse proxy.
 #
 # Examples:
 #   "tcp://[::]:12345"
 #   "tls://[::]:443?password=s3cr3t"
+#   "ws://127.0.0.1:8080?forwarded_headers=CF-Connecting-IP,X-Forwarded-For"
 listen = ["tcp://0.0.0.0:0"]
 
 # Listen address for the admin socket.

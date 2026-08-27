@@ -15,6 +15,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
 
 use rustls::pki_types::CertificateDer;
+use serde::Serialize;
 
 use crate::core::Core;
 use crate::transport::tls::extract_ed25519_pubkey_from_cert;
@@ -46,6 +47,15 @@ impl Stream {
             Stream::Ws(s) => Ok(s.peer_addr()),
             #[cfg(feature = "quic")]
             Stream::Quic(s) => Ok(s.peer_addr()),
+        }
+    }
+
+    /// Extract captured HTTP headers from an inbound WebSocket handshake.
+    fn peer_headers(&self) -> Option<&HashMap<String, String>> {
+        match self {
+            #[cfg(feature = "ws")]
+            Stream::Ws(s) => s.headers(),
+            _ => None,
         }
     }
 
@@ -378,7 +388,7 @@ impl Drop for CountingStream {
 }
 
 /// Snapshot of a link's current state (for admin API).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct LinkPeerInfo {
     pub uri: String,
     pub up: bool,
@@ -393,6 +403,9 @@ pub struct LinkPeerInfo {
     pub latency_ms: f64,
     pub cost: u64,
     pub last_error: Option<String>,
+    /// HTTP headers captured during WebSocket handshake (inbound ws/wss only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
 }
 
 /// Fired when a peer connection is established or lost.
@@ -428,6 +441,7 @@ struct ActiveConn {
     last_rx: usize,
     last_tx: usize,
     up: Instant,
+    headers: Option<HashMap<String, String>>,
 }
 
 impl ActiveLinks {
@@ -443,7 +457,7 @@ impl ActiveLinks {
         }
     }
 
-    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
+    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8, headers: Option<HashMap<String, String>>,) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
         let mut inner = self.inner.lock().await;
         // Reject duplicate: same key + same direction
         if inner.connections.values().any(|c| c.key == key && c.inbound == inbound) {
@@ -467,6 +481,7 @@ impl ActiveLinks {
                 last_rx: 0,
                 last_tx: 0,
                 up: Instant::now(),
+                headers,
             },
         );
         drop(inner);
@@ -554,6 +569,7 @@ impl ActiveLinks {
                 latency_ms: 0.0,
                 cost: 0,
                 last_error: None,
+                headers: c.headers.clone(),
             })
             .collect()
     }
@@ -653,6 +669,7 @@ impl Links {
             .to_string();
 
         let options = parse_link_options(&url)?;
+        let forwarded_headers = parse_forwarded_headers(&url);
         let core = self.core()?;
         let active = self.active.clone();
         let cancel = CancellationToken::new();
@@ -776,12 +793,13 @@ impl Links {
                                 let active = active.clone();
                                 let acceptor = tls_acceptor.clone();
                                 let remote_str = format_peer_uri(&scheme, &remote);
+                                let forwarded_headers = forwarded_headers.clone();
 
                                 tokio::spawn(async move {
                                     // Permit is held for the duration of this task
 
                                     // Perform TLS and/or WebSocket handshakes as needed
-                                    let wrapped_stream = match wrap_incoming(stream, acceptor, use_ws, remote).await {
+                                    let wrapped_stream = match wrap_incoming(stream, acceptor, use_ws, remote, &forwarded_headers,).await {
                                         Ok(s) => s,
                                         Err(e) => {
                                             tracing::debug!("{} from {}", e, remote);
@@ -1206,11 +1224,20 @@ pub(crate) async fn handle_connection(
         "outbound"
     };
     let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer_headers = stream.peer_headers().cloned();
+    let headers_display = match &peer_headers {
+        Some(h) if !h.is_empty() => {
+            let pairs: Vec<String> = h.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            format!(" [{}]", pairs.join(", "))
+        }
+        _ => String::new(),
+    };
     tracing::info!(
-        "Connected {}: {} @ {} (v{}.{})",
+        "Connected {}: {} @ {}{} (v{}.{})",
         direction,
         remote_addr,
         peer_addr,
+        headers_display,
         remote_meta.major_ver,
         remote_meta.minor_ver
     );
@@ -1218,7 +1245,7 @@ pub(crate) async fn handle_connection(
     // Register in active links (rejects duplicate key+direction)
     let inbound = link_type == LinkType::Incoming;
     let (conn_id, rx_counter, tx_counter) = match active
-        .register(uri.to_string(), inbound, remote_meta.public_key, priority)
+        .register(uri.to_string(), inbound, remote_meta.public_key, priority, peer_headers,)
         .await
     {
         Some(r) => r,
@@ -1273,9 +1300,10 @@ async fn wrap_incoming(
     acceptor: Option<TlsAcceptor>,
     use_ws: bool,
     remote: SocketAddr,
+    forwarded_headers: &[String],
 ) -> Result<Stream, String> {
     #[cfg(not(feature = "ws"))]
-    let _ = (use_ws, remote); // ws:// and wss:// are rejected at listen() time
+    let _ = (use_ws, remote, forwarded_headers); // ws:// and wss:// are rejected at listen() time
 
     #[cfg(feature = "ws")]
     if use_ws {
@@ -1292,11 +1320,11 @@ async fn wrap_incoming(
                     .1
                     .peer_certificates()
                     .and_then(|certs| certs.first().cloned());
-                let ws = ws::ws_server_handshake(Box::new(tls_stream), remote, peer_cert).await?;
+                let ws = ws::ws_server_handshake(Box::new(tls_stream), remote, peer_cert, forwarded_headers,).await?;
                 Ok(Stream::Ws(ws))
             }
             None => {
-                let ws = ws::ws_server_handshake(Box::new(stream), remote, None).await?;
+                let ws = ws::ws_server_handshake(Box::new(stream), remote, None, forwarded_headers,).await?;
                 Ok(Stream::Ws(ws))
             }
         };
@@ -1480,6 +1508,23 @@ fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
     Ok(opts)
 }
 
+/// Extract configured forwarded HTTP header names from a listener URI query string.
+/// Supports both comma-separated (`?forwarded_headers=A,B`) and repeated keys (`?forwarded_headers=A&forwarded_headers=B`).
+fn parse_forwarded_headers(url: &url::Url) -> Vec<String> {
+    let mut headers = Vec::new();
+    for (key, val) in url.query_pairs() {
+        if key == "forwarded_headers" || key == "forwarded_header" {
+            for part in val.split(',') {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    headers.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1554,5 +1599,22 @@ mod tests {
     fn test_parse_link_options_maxbackoff_too_small() {
         let url = Url::parse("tcp://example.com:12345?maxbackoff=3s").unwrap();
         assert!(parse_link_options(&url).is_err());
+    }
+    #[test]
+    fn test_parse_forwarded_headers_from_uri() {
+        let uri1 = Url::parse("ws://127.0.0.1:8080?forwarded_headers=CF-Connecting-IP,X-Forwarded-For").unwrap();
+        assert_eq!(
+            parse_forwarded_headers(&uri1),
+            vec!["CF-Connecting-IP", "X-Forwarded-For"]
+        );
+
+        let uri2 = Url::parse("ws://127.0.0.1:8080?forwarded_headers=CF-Connecting-IP&forwarded_headers=X-Real-IP").unwrap();
+        assert_eq!(
+            parse_forwarded_headers(&uri2),
+            vec!["CF-Connecting-IP", "X-Real-IP"]
+        );
+
+        let uri3 = Url::parse("ws://0.0.0.0:8080").unwrap();
+        assert!(parse_forwarded_headers(&uri3).is_empty());
     }
 }
